@@ -1,0 +1,303 @@
+from PyQt5.QtCore import QVariant # type:ignore
+from qgis.core import (QgsCoordinateTransform, # type:ignore
+                       QgsFeature,
+                       QgsFeatureSink,
+                       QgsField,
+                       QgsFields,
+                       QgsProcessing,
+                       QgsProcessingAlgorithm,
+                       QgsProcessingException,
+                       QgsProcessingParameterCrs,
+                       QgsProcessingParameterMultipleLayers,
+                       QgsProcessingParameterNumber,
+                       QgsProcessingParameterString,
+                       QgsProcessingParameterVectorDestination,
+                       QgsWkbTypes,
+                       QgsProcessingParameterBoolean,
+                       NULL)
+
+import processing
+
+from ..utils import check_geometry
+
+
+class ResolvePolygonOverlay(QgsProcessingAlgorithm):
+
+    INPUT = "INPUT"
+    FIELD = "CAMPO"
+    CRS = "CRS"
+    AREA_THRESHOLD = "AREA_THRESHOLD"
+    OUTPUT = "Risolvi_Sovrapposizioni"
+    CLEAN = "Scarta record senza attributo"
+
+    def name(self):
+        return "risolvi_overlay_poligonali"
+
+    def displayName(self):
+        return "Risolvi sovrapposizioni poligonali"
+
+    def group(self):
+        return "Rischio aree allagabili"
+
+    def groupId(self):
+        return "flood_risk"
+
+    def shortHelpString(self):
+        return "Genera una partizione poligonale senza sovrapposizioni a" \
+        "partire da più layer e assegna gli attributi per massima" \
+        "sovrapposizione."
+    
+    def createInstance(self): return ResolvePolygonOverlay()
+
+    def initAlgorithm(self, config=None):
+
+        self.addParameter(
+            QgsProcessingParameterMultipleLayers(
+                self.INPUT,
+                self.INPUT,
+                layerType=QgsProcessing.TypeVectorPolygon
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterString(
+                self.FIELD,
+                self.FIELD,
+                defaultValue = "p",
+                optional=False
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterCrs(
+                self.CRS,
+                defaultValue="EPSG:3035"
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.AREA_THRESHOLD,
+                "Soglia areale di sovrapposizione (unità mappa)",
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=1.0,
+                minValue=0.0,
+                optional=True
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterVectorDestination(
+                self.OUTPUT,
+                self.OUTPUT
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+                self.CLEAN,
+                self.CLEAN,
+                defaultValue=True,
+                optional = False
+            )
+        )
+
+    def processAlgorithm(self, parameters, context, feedback):
+        
+        poly_layers = self.parameterAsLayerList(parameters,self.INPUT,context)
+        crs = self.parameterAsCrs(parameters, self.CRS, context)
+        area_threshold = self.parameterAsDouble(parameters, self.AREA_THRESHOLD, context)
+        field = self.parameterAsString(parameters, self.FIELD, context)
+        clean = self.parameterAsBool(parameters, self.CLEAN, context)
+        
+        # Se CRS non è valido, usa il CRS del primo layer
+        if not crs.isValid():
+            crs = poly_layers[0].sourceCrs()
+
+        # DEBUG: Verifica layer e CRS
+        feedback.pushInfo('=== VERIFICA PRE-PROCESSAMENTO ===')
+        feedback.pushInfo(f'CRS target: {crs.authid()}')
+        feedback.pushInfo(f'Soglia areale: {area_threshold}')
+        feedback.pushInfo(f'Campo pericolosità: {field}')
+        
+        for layer in poly_layers:
+            feedback.pushInfo(f'Layer: {layer.name()} | CRS: {layer.sourceCrs().authid()} | Features: {layer.featureCount()}')
+            # Verifica presenza di P nulli
+            null_p_count = sum([f[field] is None for f in layer.getFeatures()])
+            feedback.pushInfo(f'  └─ P=null: {null_p_count}')
+
+        # -----------------------------
+        # MERGE
+        # -----------------------------
+        feedback.pushInfo(f'=== ESECUZIONE ===')
+        feedback.pushInfo('Merge dei layer poligonali')
+
+        merged = processing.run(# type:ignore
+            'native:mergevectorlayers',
+            {
+                'LAYERS': poly_layers,
+                'CRS': crs,
+                'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
+            },
+            context=context,
+            feedback=feedback
+        )['OUTPUT']
+
+        # -----------------------------
+        # POLYGON → LINE
+        # -----------------------------
+        feedback.pushInfo(f'Conversione in linee')
+
+        lines = processing.run(# type:ignore
+            'native:polygonstolines',
+            {
+                'INPUT': merged,
+                'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
+            },
+            context=context,
+            feedback=feedback
+        )['OUTPUT']
+
+        # -----------------------------
+        # POLYGONIZE
+        # -----------------------------
+        feedback.pushInfo('Polygonize')
+
+        poly_no_overlap = processing.run(# type:ignore
+            'native:polygonize',
+            {
+                'INPUT': lines,
+                'KEEP_FIELDS': False,
+                'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
+            },
+            context=context,
+            feedback=feedback
+        )['OUTPUT']
+
+        # -----------------------------
+        # OUTPUT SETUP
+        # -----------------------------
+        out_fields = QgsFields()
+        out_fields.append(QgsField(field, QVariant.Int))
+
+        (sink, sink_id) = self.parameterAsSink(
+            parameters,
+            self.OUTPUT,
+            context,
+            out_fields,
+            QgsWkbTypes.Polygon,
+            crs
+        )
+
+        if sink is None:
+            raise QgsProcessingException('Impossibile creare output')
+
+        # -------------------------
+        # PRE-CACHE INPUT FEATURES (trasformati al CRS target)
+        # -------------------------
+        layers_feature_list = list()
+        for layer in poly_layers:
+            layer_feats = list()
+            for feat in layer.getFeatures():
+                # Trasforma la geometria al CRS target se necessario
+                geometry = feat.geometry()
+                if layer.sourceCrs() != crs:
+                    transform = QgsCoordinateTransform(layer.sourceCrs(), crs,
+                                                       context.project())
+                    geometry.transform(transform)
+                
+                # Crea una copia del feature con la geometria trasformata
+                transformed_feat = QgsFeature(feat)
+                transformed_feat.setGeometry(geometry)
+                layer_feats.append(transformed_feat)
+            layers_feature_list.append(layer_feats)
+        
+        # -------------------------
+        # ATTRIBUZIONE P (massimo valore tra sovrapposizioni)
+        # -------------------------
+        # DEBUG: Contatori per analisi
+        total_partitions = 0
+        assigned_partitions = 0
+        orphan_partitions = 0  # Senza intersezioni sopra soglia
+        invalid = 0 # geometrie non valide
+        empty = 0 # geometrie vuote
+        with_intersections_no_p = 0  # Con intersezioni MA P=None (il vero problema)
+
+        for feat in poly_no_overlap.getFeatures():
+            geometry = feat.geometry()
+
+            if not check_geometry(geometry):
+                continue
+
+            total_partitions += 1
+
+            max_p = None
+            matching_none = list()
+            all_matches = list()
+
+            for features, layer in zip(layers_feature_list, poly_layers):
+                for f in features:
+                    input_geometry = f.geometry()
+                    attr_value = f[field]
+
+                    # controllo se esiste un'intersezione
+                    if not geometry.intersects(input_geometry):
+                        continue
+
+                    inter = geometry.intersection(input_geometry)
+                    
+                    # controllo se geometria intersezione è valida
+                    if not check_geometry(inter):
+                        continue
+
+                    # Verifica la soglia areale
+                    intersection_area = inter.area()
+                    if intersection_area < area_threshold:
+                        continue
+                    
+                    all_matches.append({
+                        'layer': layer.name(),
+                        'area': intersection_area,
+                        'attr_value': attr_value,
+                    })
+
+                    if attr_value is None:
+                        matching_none.append({
+                            'layer': layer.name(),
+                            'area': intersection_area,
+                        })
+                    
+                    else:
+                        if max_p is None or attr_value > max_p:
+                            max_p = attr_value
+            
+            out_feat = QgsFeature(out_fields)
+            out_feat.setGeometry(geometry)
+            out_feat[field] = max_p
+
+            if max_p is None and clean:
+                continue
+            else:
+                sink.addFeature(out_feat, QgsFeatureSink.FastInsert)
+
+            # DEBUG: Categorizzazione
+            if max_p is not None:
+                assigned_partitions += 1
+            else:
+                if len(matching_none) > 0:  # Ha intersezioni sopra soglia, ma P=None
+                    with_intersections_no_p += 1
+                elif len(all_matches) == 0:  # Ha intersezioni, ma tutte sotto soglia
+                    orphan_partitions += 1
+                else:  # Nessuna intersezione
+                    orphan_partitions += 1
+        
+        # Report debug
+        feedback.pushInfo(f'=== REPORT DEBUG ===')
+        feedback.pushInfo(f'Partizioni senza geometria: {empty}')
+        feedback.pushInfo(f'Partizioni non valide: {invalid}')
+        feedback.pushInfo(f'Partizioni con geometrie valide totali: {total_partitions}')
+        feedback.pushInfo(f'    di cui assegnate: {assigned_partitions}')
+        feedback.pushInfo(f'    di cui senza intersezioni valide: {orphan_partitions}')
+        feedback.pushInfo(f'    di cui con intersezioni ma {field}=None: {with_intersections_no_p}')
+        
+        return {self.OUTPUT: sink_id}

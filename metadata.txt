@@ -1,8 +1,8 @@
 [general]
 name=adbpo_toolbox
 description=Valutazione rischio aree allagabili
-version=2.0
-qgisMinimumVersion=3.28
+version=3.0.1.dev2
+qgisMinimumVersion=3.40
 category=Analysis
 author=Vincenzo Critelli
 email=vincenzo.critelli@adbpo.it

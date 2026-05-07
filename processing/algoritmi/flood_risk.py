@@ -2,16 +2,19 @@ from pathlib import Path
 
 import yaml
 from PyQt5.QtCore import QVariant
-from qgis.core import (QgsFeature,  # type:ignore
-                       QgsField,
-                       QgsFields,
-                       QgsProcessing,
-                       QgsProcessingAlgorithm,
-                       QgsProcessingParameterCrs,
-                       QgsProcessingParameterEnum,
-                       QgsProcessingParameterFeatureSink,
-                       QgsProcessingParameterFeatureSource,
-                       QgsProcessingParameterField)
+from qgis.core import ( # type:ignore
+    QgsFeature,  # type:ignore
+    QgsField,
+    QgsFields,
+    QgsProcessing,
+    QgsProcessingAlgorithm,
+    QgsProcessingParameterCrs,
+    QgsProcessingParameterEnum,
+    QgsProcessingParameterBoolean,
+    QgsProcessingParameterFeatureSink,
+    QgsProcessingParameterFeatureSource,
+    QgsProcessingParameterField,
+)
 
 import processing
 
@@ -19,17 +22,63 @@ from ..utils import get_crs_transformer
 
 risk_matrices_path = Path(__file__).parent / "matrici_rischio.yaml"
 RISK_MATRICES = yaml.safe_load(risk_matrices_path.read_text())
+OPTSUFFX = " (opzionale)"
+REQSUFFX = " (obbligatorio)"
+HFIELD = "P"
+DFIELD = "D"
+
+
+def _qgis_nativeintersection(
+    input, overlay, input_fields, overlay_fileds, context, feedback
+):
+    intx = processing.run(  # type:ignore
+        "native:intersection",
+        {
+            "INPUT": input,
+            "OVERLAY": overlay,
+            "INPUT_FIELDS": [input_fields],
+            "OVERLAY_FIELDS": [overlay_fileds],
+            "OVERLAY_FIELDS_PREFIX": "",
+            "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT,
+            "GRID_SIZE": None,
+        },
+        context=context,
+        feedback=feedback,
+    )["OUTPUT"]
+    return intx
 
 
 class CalcRisk(QgsProcessingAlgorithm):
+    
+    input_layers = dict(
+        RP = "Reticolo principale",
+        RSCM = "Reticolo secondario collinare-montano",
+        RSP = "Reticolo secondario di pianura",
+        ACM = "Ambito costiero-marino",
+        ACL = "Ambito costiero-lacuale",
+        DANNO = "Danno"
+    )
 
-    HLAYER = "HAZARD"
-    HFIELD = "HFIELD"
-    DLAYER = "DAMAGE"
-    DFIELD = "DFIELD"
-    RMAT = "MATRICI"
-    CRS = "CRS"
-    OUTPUT = "Rischio"
+    RP =    "Reticolo principale"
+    RSCM =  "Reticolo secondario collinare-montano"
+    RSP =   "Reticolo secondario di pianura"
+    ACM =   "Ambito costiero-marino"
+    ACL =   "Ambito costiero-lacuale"
+    DANNO = "Danno"
+    CRS =   "CRS"
+
+    CREATE_OUT_RP = "CREATE_OUT_RP"
+    CREATE_OUT_RSCM = "CREATE_OUT_RSCM"
+    CREATE_OUT_RSP = "CREATE_OUT_RSP"
+    CREATE_OUT_ACM = "CREATE_OUT_ACM"
+    CREATE_OUT_ACL = "CREATE_OUT_ACL"
+
+    OUTPUT_MAIN = "Rischio massimo"
+    OUTPUT_RP = "Rischio RP"
+    OUTPUT_RSCM = "Rischio RSCM"
+    OUTPUT_RSP = "Rischio RSP"
+    OUTPUT_ACM = "Rischio ACM"
+    OUTPUT_ACL = "Rischio ACL"
 
     def name(self):
         return "flood_risk"
@@ -44,150 +93,207 @@ class CalcRisk(QgsProcessingAlgorithm):
         return "flood_risk"
 
     def shortHelpString(self):
-        return "Associa una classe di rischio per ogni origine di rischio "
+        return ""
 
-    def createInstance(self): return CalcRisk()
+    def createInstance(self):
+        return CalcRisk()
 
     def initAlgorithm(self, config=None):
 
         self.addParameter(
             QgsProcessingParameterFeatureSource(
-                self.HLAYER,
-                "Layer pericolosità",
-                [QgsProcessing.TypeVector]
-            )
-        )
-
-        self.addParameter(
-            QgsProcessingParameterField(
-                self.HFIELD,
-                "Campo pericolosità",
-                parentLayerParameterName=self.HLAYER,
-                type=QgsProcessingParameterField.Numeric
+                self.RP, self.RP + OPTSUFFX, [QgsProcessing.TypeVector],
+                optional=True
             )
         )
 
         self.addParameter(
             QgsProcessingParameterFeatureSource(
-                self.DLAYER,
-                "Layer danno",
-                [QgsProcessing.TypeVector]
+                self.RSCM,
+                self.RSCM + OPTSUFFX,
+                [QgsProcessing.TypeVector],
+                optional=True,
             )
         )
 
         self.addParameter(
-            QgsProcessingParameterField(
-                self.DFIELD,
-                "Campo danno",
-                parentLayerParameterName=self.DLAYER,
-                type=QgsProcessingParameterField.Numeric
+            QgsProcessingParameterFeatureSource(
+                self.RSP, self.RSP + OPTSUFFX, [QgsProcessing.TypeVector],
+                optional=True
             )
         )
 
         self.addParameter(
-            QgsProcessingParameterEnum(
-                self.RMAT,
-                "Matrici di rischio",
-                options=list(RISK_MATRICES.keys()),
-                allowMultiple=True
+            QgsProcessingParameterFeatureSource(
+                self.ACM, self.ACM + OPTSUFFX, [QgsProcessing.TypeVector],
+                optional=True
             )
         )
 
         self.addParameter(
-            QgsProcessingParameterCrs(
-                self.CRS,
-                defaultValue="EPSG:3035"
+            QgsProcessingParameterFeatureSource(
+                self.ACL, self.ACL + OPTSUFFX, [QgsProcessing.TypeVector],
+                optional=True
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterFeatureSource(
+                self.DANNO,
+                self.DANNO + REQSUFFX,
+                [QgsProcessing.TypeVector],
+                optional=False,
+            )
+        )
+
+        self.addParameter(QgsProcessingParameterCrs(self.CRS, defaultValue="EPSG:3035"))
+
+        self.addParameter(
+            QgsProcessingParameterFeatureSink(self.OUTPUT_MAIN, "Output rischio")
+        )
+
+        ### CHECKBOX
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+                self.CREATE_OUT_RP, self.CREATE_OUT_RP, defaultValue=False
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+                self.CREATE_OUT_RSCM, self.CREATE_OUT_RSCM, defaultValue=False
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+                self.CREATE_OUT_RSP, self.CREATE_OUT_RSP, defaultValue=False
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+                self.CREATE_OUT_ACM, self.CREATE_OUT_ACM, defaultValue=False
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+                self.CREATE_OUT_ACL, self.CREATE_OUT_ACL, defaultValue=False
+            )
+        )
+
+        ### OUTPUT OPZIONALI
+        self.addParameter(
+            QgsProcessingParameterFeatureSink(
+                self.OUTPUT_RP, self.OUTPUT_RP, optional=True
             )
         )
 
         self.addParameter(
             QgsProcessingParameterFeatureSink(
-                self.OUTPUT,
-                "Output rischio"
+                self.OUTPUT_RSCM, self.OUTPUT_RSCM, optional=True
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterFeatureSink(
+                self.OUTPUT_RSP, self.OUTPUT_RSP, optional=True
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterFeatureSink(
+                self.OUTPUT_ACM, self.OUTPUT_ACM, optional=True
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterFeatureSink(
+                self.OUTPUT_ACL, self.OUTPUT_ACL, optional=True
             )
         )
 
     def processAlgorithm(self, parameters, context, feedback):
-        
-        hlayer = self.parameterAsVectorLayer(parameters, self.HLAYER, context)
-        dlayer = self.parameterAsVectorLayer(parameters, self.DLAYER, context)
-        hfield = self.parameterAsString(parameters, self.HFIELD, context)
-        dfield = self.parameterAsString(parameters, self.DFIELD, context)
-        matrici_idx = self.parameterAsEnums(parameters, self.RMAT, context)
+
+        rp = self.parameterAsVectorLayer(parameters, self.RP, context)
+        rscm = self.parameterAsVectorLayer(parameters, self.RSCM, context)
+        rsp = self.parameterAsVectorLayer(parameters, self.RSP, context)
+        acm = self.parameterAsVectorLayer(parameters, self.ACM, context)
+        acl = self.parameterAsVectorLayer(parameters, self.ACL, context)
+        danno = self.parameterAsVectorLayer(parameters, self.DANNO, context)
+
         crs = self.parameterAsCrs(parameters, self.CRS, context)
         crs_changed = False
-        
-        matrici_scelte = [list(RISK_MATRICES.keys())[i] for i in matrici_idx]
 
-        fields = QgsFields()
-        fields.append(QgsField(hfield, QVariant.Int))
-        fields.append(QgsField(dfield, QVariant.Int))
+        ambiti_territoriali = [rp, rscm, rsp, acm, acl]
+        matrici_rischio = [
+            RISK_MATRICES["mat1"],
+            RISK_MATRICES["mat1"],
+            RISK_MATRICES["mat2"],
+            RISK_MATRICES["mat2"],
+            RISK_MATRICES["mat3"],
+        ]
 
-        for m in matrici_scelte:
-            fields.append(QgsField(f"R_{m}", QVariant.Int))
+        # sink, sink_id = self.parameterAsSink(
+        #     parameters,
+        #     self.OUTPUT_MAIN,
+        #     context,
+        #     fields,
+        #     intx.wkbType(),
+        #     crs
+        # )
 
-        fields.append(QgsField("R_MAX", QVariant.Int))
+        # fields = QgsFields()
+        # fields.append(QgsField(HFIELD, QVariant.Int))
+        # fields.append(QgsField(DFIELD, QVariant.Int))
 
-        hd_layer = processing.run( #type:ignore
-            "native:intersection",
-            {
-                'INPUT': hlayer,
-                'OVERLAY': dlayer,
-                'INPUT_FIELDS': [hfield],
-                'OVERLAY_FIELDS': [dfield],
-                'OVERLAY_FIELDS_PREFIX': '',
-                'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT,
-                'GRID_SIZE': None
-            },
-            context=context,
-            feedback=feedback)['OUTPUT']
+        # for m in matrici_scelte:
+        #     fields.append(QgsField(f"R_{m}", QVariant.Int))
 
-        hd_layer_crs = hd_layer.sourceCrs()
-        transform = get_crs_transformer(hd_layer_crs, crs, context)
+        # fields.append(QgsField("R_MAX", QVariant.Int))
 
-        sink, sink_id = self.parameterAsSink(
-            parameters,
-            self.OUTPUT,
-            context,
-            fields,
-            hd_layer.wkbType(),
-            crs
-        )
+        # intersects = list()
+        sinked_ids = list()
+        for layer, mat in zip(ambiti_territoriali, matrici_rischio):
+            fields = QgsFields()
+            fields.append(QgsField(HFIELD, QVariant.Int))
+            fields.append(QgsField(DFIELD, QVariant.Int))
 
-        for feat in hd_layer.getFeatures():
-            p = feat[hfield]
-            d = feat[dfield]
+            intx = _qgis_nativeintersection(
+                layer, danno, HFIELD, DFIELD, context=context, feedback=feedback
+            )
 
-            new_feat = QgsFeature(fields)
-            geom = feat.geometry()
+            intx_crs = intx.sourceCrs()
+            transform = get_crs_transformer(intx_crs, crs, context)
 
-            if crs != hd_layer_crs:
-                crs_changed = True
-                if geom and not geom.isEmpty():
-                    geom.transform(transform)
-            else:
-                pass
+            for feat in intx.getFeatures():
+                p = feat[HFIELD]
+                d = feat[DFIELD]
 
-            new_feat.setGeometry(geom)
+                new_feat = QgsFeature(fields)
+                geom = feat.geometry()
 
-            rischi = list()
-            for m in matrici_scelte:
-                valore = RISK_MATRICES[m].get(p, dict()).get(d, None)
-                rischi.append(valore)
-                new_feat[f"R_{m}"] = valore
+                if crs != intx_crs:
+                    crs_changed = True
+                    if geom and not geom.isEmpty():
+                        geom.transform(transform)
+                else:
+                    pass
 
-            if any([e is not None for e in rischi]):
-                rmax = int(max([r for r in rischi if r is not None]))
-            else:
-                rmax = None
+                new_feat.setGeometry(geom)
 
-            new_feat.setAttribute(hfield, p)
-            new_feat.setAttribute(dfield, d)
-            new_feat.setAttribute("R_MAX", rmax)
+                valore = mat.get(p, dict()).get(d, None)
+                new_feat[f"R"] = valore
 
-            sink.addFeature(new_feat)
-        
-        if crs_changed:
-            feedback.pushInfo(f"CRS cambiato da {hd_layer_crs.authid()} a {crs.authid()}")
+                new_feat.setAttribute(HFIELD, p)
+                new_feat.setAttribute(DFIELD, d)
 
-        return {self.OUTPUT: sink_id}
+                sink.addFeature(new_feat)
+
+            if crs_changed:
+                feedback.pushInfo(
+                    f"CRS cambiato da {intx_crs.authid()} a {crs.authid()}"
+                )
+
+        return

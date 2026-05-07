@@ -1,6 +1,6 @@
 from PyQt5.QtCore import QVariant  # type: ignore
-from qgis.core import (
-    QgsCoordinateTransform,  # type: ignore
+from qgis.core import (  # type: ignore
+    QgsCoordinateTransform,
     QgsFeature,
     QgsFeatureSink,
     QgsField,
@@ -20,7 +20,15 @@ from qgis.core import (
 
 import processing
 
-from ..utils import check_geometry, _ftransformCRS
+from ..utils import (
+    check_geometry,
+    _ftransformCRS,
+    native_dissolve,
+    native_merge,
+    native_polygonize,
+    native_polygonstolines,
+    native_reprojectlayer,
+)
 
 
 class ResolvePolygonOverlay(QgsProcessingAlgorithm):
@@ -29,7 +37,7 @@ class ResolvePolygonOverlay(QgsProcessingAlgorithm):
     FIELD = "CAMPO"
     CRS = "CRS"
     AREA_THRESHOLD = "AREA_THRESHOLD"
-    OUTPUT = "Risolvi_Sovrapposizioni"
+    OUTPUT = "RisolviSovrapposizioni"
     CLEAN = "Scarta record senza attributo"
 
     def name(self):
@@ -101,110 +109,66 @@ class ResolvePolygonOverlay(QgsProcessingAlgorithm):
         field = self.parameterAsString(parameters, self.FIELD, context)
         clean = self.parameterAsBool(parameters, self.CLEAN, context)
 
-        # Se CRS non è valido, usa il CRS del primo layer
-        if not crs.isValid():
-            crs = poly_layers[0].sourceCrs()
-
         # DEBUG: Verifica layer e CRS
         feedback.pushInfo("=== VERIFICA PRE-PROCESSAMENTO ===")
         feedback.pushInfo(f"CRS target: {crs.authid()}")
         feedback.pushInfo(f"Soglia areale: {area_threshold}")
         feedback.pushInfo(f"Campo pericolosità: {field}")
 
+        verified = list()
         for layer in poly_layers:
             feedback.pushInfo(
                 f"Layer: {layer.name()} | CRS: {layer.sourceCrs().authid()} | Features: {layer.featureCount()}"
             )
             # Verifica presenza di P nulli
             null_p_count = sum([f[field] is None for f in layer.getFeatures()])
-            feedback.pushInfo(f"  └─ P=null: {null_p_count}")
+            feedback.pushInfo(f"  └─ {field}=null: {null_p_count}")
 
-        # -----------------------------
-        # DISSOLVI
-        # -----------------------------
-        poly_lays_diss = list()
-        for layer in poly_layers:
-            feedback.pushInfo(f"DISSOLVO LAYER {layer.name()} (FIELD: {{field}})")
+            if layer.sourceCrs() != crs:
+                layer = native_reprojectlayer(layer, crs)
+                verified.append(layer)
+            else:
+                verified.append(layer)
 
-            diss = processing.run(# type: ignore
-                "native:dissolve",
-                {  
-                    "INPUT": layer,
-                    "FIELD": [field],
-                    "SEPARATE_DISJOINT": False,
-                    "OUTPUT": "TEMPORARY_OUTPUT",
-                },
-            )["OUTPUT"]
-            poly_lays_diss.append(diss)
-
-        # -----------------------------
-        # FONDI VETTORI
-        # -----------------------------
         feedback.pushInfo(f"=== ESECUZIONE ===")
-        feedback.pushInfo("Merge dei layer poligonali")
 
-        merged = processing.run(  # type: ignore
-            "native:mergevectorlayers",
-            {
-                "LAYERS": poly_lays_diss,
-                "CRS": crs,
-                "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT,
-            },
-            context=context,
-            feedback=feedback,
-        )["OUTPUT"]
+        # DISSOLVI
+        dissolved_layers = list()
+        for layer in verified:
+            dissolved = native_dissolve(layer, field, False, context=context, feedback=feedback)
+            dissolved_layers.append(dissolved)
 
-        # -----------------------------
-        # DA LINEE A POLIGONI
-        # -----------------------------
-        feedback.pushInfo(f"Conversione in linee")
+        # FONDI VETTORI
+        merged = native_merge(dissolved_layers, crs, context=context, feedback=feedback)
 
-        lines = processing.run(  # type: ignore
-            "native:polygonstolines",
-            {"INPUT": merged, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
-            context=context,
-            feedback=feedback,
-        )["OUTPUT"]
+        # DA POLIGONI A LINEE
+        lines = native_polygonstolines(merged, context=context, feedback=feedback)
 
-        # -----------------------------
-        # POLIGONIZZA (da linee a poligoni)
-        # -----------------------------
-        feedback.pushInfo("Polygonize")
+        # POLIGONIZZA
+        polygonized = native_polygonize(lines, context=context, feedback=feedback)
 
-        poly_no_overlap = processing.run(  # type: ignore
-            "native:polygonize",
-            {
-                "INPUT": lines,
-                "KEEP_FIELDS": False,
-                "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT,
-            },
-            context=context,
-            feedback=feedback,
-        )["OUTPUT"]
+        # PRE-CACHE INPUT FEATURES
+        layers_feature_list = list()
+        for layer in verified:
+            layers_feature_list.append(list(layer.getFeatures()))
 
-        # -----------------------------
         # OUTPUT SETUP
-        # -----------------------------
         out_fields = QgsFields()
         out_fields.append(QgsField(field, QVariant.Int))
 
         sink, sink_id = self.parameterAsSink(
-            parameters, self.OUTPUT, context, out_fields, QgsWkbTypes.Polygon, crs
+            parameters,
+            self.OUTPUT,
+            context,
+            out_fields,
+            QgsWkbTypes.Polygon,
+            crs,
         )
 
         if sink is None:
             raise QgsProcessingException("Impossibile creare output")
 
-        # -------------------------
-        # PRE-CACHE INPUT FEATURES (trasformati al CRS target)
-        # -------------------------
-        layers_feature_list = list()
-        for layer in poly_layers:
-            layers_feature_list.append(_ftransformCRS(layer, crs, context, feedback))
-
-        # -------------------------
         # ATTRIBUZIONE P (massimo valore tra sovrapposizioni)
-        # -------------------------
         # DEBUG: Contatori per analisi
         total_partitions = 0
         assigned_partitions = 0
@@ -213,7 +177,7 @@ class ResolvePolygonOverlay(QgsProcessingAlgorithm):
         empty = 0  # geometrie vuote
         with_intersections_no_p = 0  # Con intersezioni MA P=None (il vero problema)
 
-        for feat in poly_no_overlap.getFeatures():
+        for feat in polygonized.getFeatures():
             geometry = feat.geometry()
 
             if not check_geometry(geometry):
@@ -234,14 +198,14 @@ class ResolvePolygonOverlay(QgsProcessingAlgorithm):
                     if not geometry.intersects(input_geometry):
                         continue
 
-                    inter = geometry.intersection(input_geometry)
+                    _intx = geometry.intersection(input_geometry)
 
                     # controllo se geometria intersezione è valida
-                    if not check_geometry(inter):
+                    if not check_geometry(_intx):
                         continue
 
                     # Verifica la soglia areale
-                    intersection_area = inter.area()
+                    intersection_area = _intx.area()
                     if intersection_area < area_threshold:
                         continue
 

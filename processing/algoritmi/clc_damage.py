@@ -16,7 +16,7 @@ from qgis.core import (QgsFeature,  # type:ignore
                        QgsWkbTypes)
 
 
-from ..utils import get_crs_transformer
+from ..utils import _get_crs_transformer
 
 class CLCToDamage(QgsProcessingAlgorithm):
 
@@ -85,7 +85,7 @@ class CLCToDamage(QgsProcessingAlgorithm):
         json_map = Path(__file__).parent / "clc2damage.json"
         clc_map = json.loads(json_map.read_text())
 
-        transformer = get_crs_transformer(clc_layer.sourceCrs(), crs, context)
+        transformer = _get_crs_transformer(clc_layer.sourceCrs(), crs, context)
         
         out_fields = QgsFields()
 

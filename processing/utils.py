@@ -12,10 +12,10 @@ def _get_crs_transformer(src_crs, out_crs, context):
     return QgsCoordinateTransform(src_crs, out_crs, context.transformContext())
 
 
-def _ftransformCRS(layer, target_crs, context, feedback) -> list:
+def _ftransformCRS(layer, target_crs, context=None, feedback=None) -> list: # non utilizzata
     layer_feats = list()
+
     if layer.sourceCrs() != target_crs:
-        feedback.pushInfo(f"Riproietto layer.\nCRS target: {target_crs}")
         transformer = _get_crs_transformer(layer.sourceCrs(), target_crs, context)
         for feat in layer.getFeatures():
             geometry = feat.geometry()
@@ -23,7 +23,9 @@ def _ftransformCRS(layer, target_crs, context, feedback) -> list:
             transformed_feat = QgsFeature(feat)
             transformed_feat.setGeometry(geometry)
             layer_feats.append(transformed_feat)
+        
         return layer_feats
+    
     else:
         return [feat for feat in layer.getFeatures()]
 
@@ -48,7 +50,7 @@ def native_reprojectlayer(
     }
 
     if feedback is not None:
-        feedback.pushInfo(f"Riproietto layer.\nCRS target: {target_crs}")
+        feedback.pushInfo(f"RIPROIETTA LAYER {layer.name()} a {target_crs}")
 
     result = processing.run(  # type: ignore
         "native:reprojectlayer", params, context, feedback
@@ -58,7 +60,7 @@ def native_reprojectlayer(
 
 
 def native_intersection(
-    input, overlay, input_fields, overlay_fields, context, feedback
+    input, overlay, input_fields, overlay_fields, context=None, feedback=None
 ):
     intx = processing.run(  # type: ignore
         "native:intersection",
@@ -80,19 +82,21 @@ def native_intersection(
 def solve_overlap(
     inputs: list, field="R", crs="EPSG:3035", context=None, feedback=None
 ):
+    if feedback is not None:
+        feedback.pushInfo("RISOLVI SOVRAPPOSIZIONI POLIGONALI")
     solved = processing.run(  # type: ignore
         "adbpo:risolvi_overlay_poligonali",
         {
             "INPUT": inputs,
-            "CAMPO": field,
+            "FIELD": field,
             "CRS": QgsCoordinateReferenceSystem(crs),
             "AREA_THRESHOLD": 1,
-            "RisolviSovrapposizioni": "TEMPORARY_OUTPUT",
-            "Scarta record senza attributo": True,
+            "OUTPUT": "TEMPORARY_OUTPUT",
+            "CLEAN": True,
         },
         context=context,
         feedback=feedback
-    )["RisolviSovrapposizioni"]
+    )["OUTPUT"]
     return solved
 
 
@@ -105,7 +109,7 @@ def native_dissolve(
     feedback=None,
 ):
     if feedback is not None:
-        feedback.pushInfo(f"Dissolvo layer: {layer.name()} ({field})")
+        feedback.pushInfo(f"DISSOLVI {layer.name()} ({field})")
 
     dissolved = processing.run(  # type: ignore
         "native:dissolve",
@@ -130,7 +134,7 @@ def native_merge(
     feedback=None
 ):
     if feedback is not None:
-        feedback.pushInfo("Fondi vettori")
+        feedback.pushInfo("FONDI VETTORI")
 
     merged = processing.run(  # type: ignore
         "native:mergevectorlayers",
@@ -153,7 +157,7 @@ def native_polygonize(
     feedback=None
 ):
     if feedback is not None:
-        feedback.pushInfo("Poligonizza")
+        feedback.pushInfo("POLIGONIZZA")
 
     polygonized = processing.run(  # type: ignore
         "native:polygonize",
@@ -175,7 +179,7 @@ def native_polygonstolines(
     feedback=None
 ):
     if feedback is not None:
-        feedback.pushInfo("Da poligoni a linee")
+        feedback.pushInfo("DA POLIGONI A LINEE")
 
     lines = processing.run(  # type: ignore
         "native:polygonstolines", {

@@ -9,6 +9,9 @@ from qgis.core import (  # type: ignore
     QgsFields,
     QgsVectorLayer,
     QgsProcessing,
+    QgsProcessingUtils,
+    QgsSpatialIndex,
+    QgsFeatureSink,
     QgsProcessingAlgorithm,
     QgsProcessingParameterCrs,
     QgsProcessingParameterEnum,
@@ -20,19 +23,16 @@ from qgis.core import (  # type: ignore
 import processing
 
 from ..utils import (
-    _get_crs_transformer,
     native_reprojectlayer,
     native_intersection,
     solve_overlap,
 )
 
+from .clc_damage import DFIELD
+
 risk_matrices_path = Path(__file__).parent / "matrici_rischio.yaml"
 RISK_MATRICES = yaml.safe_load(risk_matrices_path.read_text())
-OPTSUFFX = " (opzionale)"
-REQSUFFX = " (obbligatorio)"
-HFIELD = "P"
-DFIELD = "DANNO"
-
+HFIELD = 'P'
 
 class CalcRisk(QgsProcessingAlgorithm):
 
@@ -94,13 +94,13 @@ class CalcRisk(QgsProcessingAlgorithm):
             {
                 "input": self.RSP,
                 "checkbox": self.CREATE_OUT_RSP,
-                "output": "Reticolo secondario di pianura",
+                "output": "Rischio RSCM",
                 "label": "Reticolo secondario di pianura",
             },
             {
                 "input": self.ACM,
                 "checkbox": self.CREATE_OUT_ACM,
-                "output": "Ambito costiero-marino",
+                "output": "Rischio ACM",
                 "label": "Ambito costiero-marino",
             },
             {
@@ -133,6 +133,9 @@ class CalcRisk(QgsProcessingAlgorithm):
                 )
             )
 
+        # CRS
+        self.addParameter(QgsProcessingParameterCrs(self.CRS, defaultValue="EPSG:3035"))
+
         # OUTPUT PRINCIPALE
         self.addParameter(
             QgsProcessingParameterFeatureSink(self.OUTPUT_MAIN,
@@ -150,39 +153,14 @@ class CalcRisk(QgsProcessingAlgorithm):
                 )
             )
 
-        # CRS
-        self.addParameter(QgsProcessingParameterCrs(self.CRS, defaultValue="EPSG:3035"))
-
-        ## OUTPUT OPZIONALI
-        # self.addParameter(
-        #     QgsProcessingParameterFeatureSink(
-        #         self.OUTPUT_RP, self.OUTPUT_RP, optional=True
-        #     )
-        # )
-
-        # self.addParameter(
-        #     QgsProcessingParameterFeatureSink(
-        #         self.OUTPUT_RSCM, self.OUTPUT_RSCM, optional=True
-        #     )
-        # )
-
-        # self.addParameter(
-        #     QgsProcessingParameterFeatureSink(
-        #         self.OUTPUT_RSP, self.OUTPUT_RSP, optional=True
-        #     )
-        # )
-
-        # self.addParameter(
-        #     QgsProcessingParameterFeatureSink(
-        #         self.OUTPUT_ACM, self.OUTPUT_ACM, optional=True
-        #     )
-        # )
-
-        # self.addParameter(
-        #     QgsProcessingParameterFeatureSink(
-        #         self.OUTPUT_ACL, self.OUTPUT_ACL, optional=True
-        #     )
-        # )
+            # OUTPUT OPZIONALI
+            self.addParameter(
+                QgsProcessingParameterFeatureSink(
+                    layer['output'],
+                    layer['output'],
+                    optional=True
+                )
+            )
 
     def processAlgorithm(self, parameters, context, feedback):
 
@@ -202,13 +180,13 @@ class CalcRisk(QgsProcessingAlgorithm):
 
         ambiti_territoriali = list()
 
-        feedback.pushInfo("Itero i layer di input")
+        feedback.pushDebugInfo("Itero i layer di input")
         for layer_name, layer, mat in zip(
             self.input_layers, self.optional_layers, matrici_rischio
         ):
             vector = self.parameterAsVectorLayer(parameters, layer_name, context)
 
-            feedback.pushInfo(f"{vector}\n{layer_name}\n{mat}")
+            feedback.pushDebugInfo(f"{vector}\n{layer_name}\n{mat}")
             if vector:
                 if vector.sourceCrs() != crs:
                     vector = native_reprojectlayer(vector, crs)
@@ -236,7 +214,6 @@ class CalcRisk(QgsProcessingAlgorithm):
                     intx.changeAttributeValue(feat.id(), intx.fields().indexOf("R"), rischio)
                 intx.commitChanges()
 
-                QgsProject.instance().addMapLayer(intx)
                 ambiti_territoriali.append(intx)
 
                 if create_output:
@@ -250,6 +227,9 @@ class CalcRisk(QgsProcessingAlgorithm):
                         intx.sourceCrs(),
                     )
 
+                    for feat in intx.getFeatures():
+                        sink.addFeature(feat, QgsFeatureSink.FastInsert)
+
                     results[layer["output"]] = dest_id
 
         solved = solve_overlap(inputs = ambiti_territoriali,
@@ -258,12 +238,18 @@ class CalcRisk(QgsProcessingAlgorithm):
                                context = context,
                                feedback = feedback)
         
-        # Carica il layer dal path restituito
-        risk_layer = QgsVectorLayer(solved, "Rischio massimo", "ogr")
-        if risk_layer.isValid():
-            QgsProject.instance().addMapLayer(risk_layer)
-        else:
-            feedback.pushWarning("Impossibile caricare il layer di rischio massimo")
-        
+        main_sink, main_dest_id = self.parameterAsSink(
+            parameters,
+            self.OUTPUT_MAIN,
+            context,
+            solved.fields(),
+            solved.wkbType(),
+            solved.sourceCrs(),
+        )
+
+        for feat in solved.getFeatures():
+            main_sink.addFeature(feat, QgsFeatureSink.FastInsert)
+
+        results[self.OUTPUT_MAIN] = main_dest_id
 
         return results

@@ -8,6 +8,7 @@ from qgis.core import (QgsFeature,  # type:ignore
                        QgsFields,
                        QgsProcessing,
                        QgsProcessingAlgorithm,
+                       QgsProcessingParameterFeatureSink,
                        QgsProcessingException,
                        QgsProcessingParameterCrs,
                        QgsProcessingParameterField,
@@ -16,14 +17,15 @@ from qgis.core import (QgsFeature,  # type:ignore
                        QgsWkbTypes)
 
 
-from ..utils import _get_crs_transformer
+from ..utils import _get_crs_transformer, native_reprojectlayer
+DFIELD = "D"
 
 class CLCToDamage(QgsProcessingAlgorithm):
 
-    INPUT = "Corine Land Cover"
-    FIELD = "CAMPO"
+    INPUT = "CLC_LAYER"
+    FIELD = "CLC_FIELD"
     CRS = "CRS"
-    OUTPUT = "CLC_Danno"
+    OUTPUT = "OUTPUT"
 
     def name(self):
         return "clc_danno"
@@ -38,7 +40,7 @@ class CLCToDamage(QgsProcessingAlgorithm):
         return "flood_risk"
 
     def shortHelpString(self):
-        return "Associa una classe di danno alle classi di uso del suolo derivate" \
+        return "Associa una classe di danno alle classi di uso del suolo derivate " +\
         "da dati Corine Land Cover"
     
     def createInstance(self): return CLCToDamage()
@@ -56,7 +58,7 @@ class CLCToDamage(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterField(
                 self.FIELD,
-                "Campo",
+                "Campo CLC",
                 parentLayerParameterName=self.INPUT,
                 type=QgsProcessingParameterField.String
             )
@@ -70,9 +72,10 @@ class CLCToDamage(QgsProcessingAlgorithm):
         )
 
         self.addParameter(
-            QgsProcessingParameterVectorDestination(
+            QgsProcessingParameterFeatureSink(
                 self.OUTPUT,
-                "Output danno"
+                "Output danno",
+                type=QgsProcessing.TypeVectorPolygon
             )
         )
 
@@ -85,12 +88,13 @@ class CLCToDamage(QgsProcessingAlgorithm):
         json_map = Path(__file__).parent / "clc2damage.json"
         clc_map = json.loads(json_map.read_text())
 
-        transformer = _get_crs_transformer(clc_layer.sourceCrs(), crs, context)
-        
+        if clc_layer.sourceCrs() != crs:
+            clc_layer = native_reprojectlayer(clc_layer, crs)
+
         out_fields = QgsFields()
 
         out_fields.append(QgsField(clc_field, QVariant.String, len=10))
-        out_fields.append(QgsField("DANNO", QVariant.Int))
+        out_fields.append(QgsField(DFIELD, QVariant.Int))
 
         (sink, sink_id) = self.parameterAsSink(
             parameters,
@@ -112,19 +116,12 @@ class CLCToDamage(QgsProcessingAlgorithm):
                 break
 
             clc_val = str(feat[idx_src])
-
-            new_val = clc_map.get(clc_val, 1)
-
+            new_val = clc_map.get(clc_val, 1) # valore di default è 1
             new_feat = QgsFeature(out_fields)
-
             geom = feat.geometry()
-            if clc_layer.sourceCrs() != crs:
-                if geom and not geom.isEmpty():
-                    geom.transform(transformer)
-
             new_feat.setGeometry(geom)
             new_feat[clc_field] = clc_val
-            new_feat["DANNO"] = new_val
+            new_feat[DFIELD] = new_val
 
             sink.addFeature(new_feat, QgsFeatureSink.FastInsert)
 

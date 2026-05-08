@@ -8,11 +8,13 @@ from qgis.core import (  # type: ignore
     QgsProcessing,
     QgsProcessingAlgorithm,
     QgsProcessingException,
+    QgsSpatialIndex,
     QgsProcessingParameterCrs,
     QgsProcessingParameterMultipleLayers,
     QgsProcessingParameterNumber,
     QgsProcessingParameterString,
     QgsProcessingParameterVectorDestination,
+    QgsProcessingParameterFeatureSink,
     QgsWkbTypes,
     QgsProcessingParameterBoolean,
     NULL,
@@ -22,7 +24,6 @@ import processing
 
 from ..utils import (
     check_geometry,
-    _ftransformCRS,
     native_dissolve,
     native_merge,
     native_polygonize,
@@ -30,15 +31,14 @@ from ..utils import (
     native_reprojectlayer,
 )
 
-
 class ResolvePolygonOverlay(QgsProcessingAlgorithm):
 
     INPUT = "INPUT"
-    FIELD = "CAMPO"
+    FIELD = "FIELD"
     CRS = "CRS"
     AREA_THRESHOLD = "AREA_THRESHOLD"
-    OUTPUT = "RisolviSovrapposizioni"
-    CLEAN = "Scarta record senza attributo"
+    OUTPUT = "OUTPUT"
+    CLEAN = "CLEAN"
 
     def name(self):
         return "risolvi_overlay_poligonali"
@@ -54,9 +54,9 @@ class ResolvePolygonOverlay(QgsProcessingAlgorithm):
 
     def shortHelpString(self):
         return (
-            "Genera una partizione poligonale senza sovrapposizioni a"
-            "partire da più layer e assegna gli attributi per massima"
-            "sovrapposizione."
+            "Genera una partizione poligonale senza sovrapposizioni a "
+            + "partire da più layer e assegna gli attributi per massima "
+            + "sovrapposizione."
         )
 
     def createInstance(self):
@@ -66,13 +66,13 @@ class ResolvePolygonOverlay(QgsProcessingAlgorithm):
 
         self.addParameter(
             QgsProcessingParameterMultipleLayers(
-                self.INPUT, self.INPUT, layerType=QgsProcessing.TypeVectorPolygon
+                self.INPUT, "Layer(s) di input", layerType=QgsProcessing.TypeVectorPolygon
             )
         )
 
         self.addParameter(
             QgsProcessingParameterString(
-                self.FIELD, self.FIELD, defaultValue="p", optional=False
+                self.FIELD, "Nome campo", defaultValue="p", optional=False
             )
         )
 
@@ -90,12 +90,19 @@ class ResolvePolygonOverlay(QgsProcessingAlgorithm):
         )
 
         self.addParameter(
-            QgsProcessingParameterVectorDestination(self.OUTPUT, self.OUTPUT)
+            QgsProcessingParameterFeatureSink(
+                self.OUTPUT,
+                "Risolvi sovrapposizioni",
+                type=QgsProcessing.TypeVectorPolygon,
+            )
         )
 
         self.addParameter(
             QgsProcessingParameterBoolean(
-                self.CLEAN, self.CLEAN, defaultValue=True, optional=False
+                self.CLEAN,
+                "Scarta record senza attributo",
+                defaultValue=True,
+                optional=False,
             )
         )
 
@@ -110,19 +117,19 @@ class ResolvePolygonOverlay(QgsProcessingAlgorithm):
         clean = self.parameterAsBool(parameters, self.CLEAN, context)
 
         # DEBUG: Verifica layer e CRS
-        feedback.pushInfo("=== VERIFICA PRE-PROCESSAMENTO ===")
-        feedback.pushInfo(f"CRS target: {crs.authid()}")
-        feedback.pushInfo(f"Soglia areale: {area_threshold}")
-        feedback.pushInfo(f"Campo pericolosità: {field}")
+        feedback.pushDebugInfo("=== VERIFICA PRE-PROCESSAMENTO ===")
+        feedback.pushDebugInfo(f"CRS target: {crs.authid()}")
+        feedback.pushDebugInfo(f"Soglia areale: {area_threshold}")
+        feedback.pushDebugInfo(f"Nome campo input: {field}")
 
         verified = list()
         for layer in poly_layers:
-            feedback.pushInfo(
+            feedback.pushDebugInfo(
                 f"Layer: {layer.name()} | CRS: {layer.sourceCrs().authid()} | Features: {layer.featureCount()}"
             )
             # Verifica presenza di P nulli
             null_p_count = sum([f[field] is None for f in layer.getFeatures()])
-            feedback.pushInfo(f"  └─ {field}=null: {null_p_count}")
+            feedback.pushDebugInfo(f"  └─ {field}=null: {null_p_count}")
 
             if layer.sourceCrs() != crs:
                 layer = native_reprojectlayer(layer, crs)
@@ -130,12 +137,14 @@ class ResolvePolygonOverlay(QgsProcessingAlgorithm):
             else:
                 verified.append(layer)
 
-        feedback.pushInfo(f"=== ESECUZIONE ===")
+        feedback.pushDebugInfo(f"=== ESECUZIONE ===")
 
         # DISSOLVI
         dissolved_layers = list()
         for layer in verified:
-            dissolved = native_dissolve(layer, field, False, context=context, feedback=feedback)
+            dissolved = native_dissolve(
+                layer, field, False, context=context, feedback=feedback
+            )
             dissolved_layers.append(dissolved)
 
         # FONDI VETTORI
@@ -148,13 +157,33 @@ class ResolvePolygonOverlay(QgsProcessingAlgorithm):
         polygonized = native_polygonize(lines, context=context, feedback=feedback)
 
         # PRE-CACHE INPUT FEATURES
-        layers_feature_list = list()
+        layers_feature_dict = list()
+        field_indices = list()
+        layer_indexes = list()
+
         for layer in verified:
-            layers_feature_list.append(list(layer.getFeatures()))
+            idx = QgsSpatialIndex()
+            fdict = dict()
+
+            for f in layer.getFeatures():
+                fdict[f.id()] = f
+                idx.insertFeature(f)
+
+            layers_feature_dict.append(fdict)
+
+            field_idx = layer.fields().indexOf(field)
+            field_indices.append(field_idx)
+            layer_indexes.append(idx)
+
+            # Verifica che il campo esista
+            if field_idx == -1:
+                raise QgsProcessingException(
+                    f"Campo '{field}' non trovato in layer '{layer.name()}'"
+                )
 
         # OUTPUT SETUP
         out_fields = QgsFields()
-        out_fields.append(QgsField(field, QVariant.Int))
+        out_fields.append(QgsField(field.upper(), QVariant.Int))
 
         sink, sink_id = self.parameterAsSink(
             parameters,
@@ -172,36 +201,40 @@ class ResolvePolygonOverlay(QgsProcessingAlgorithm):
         # DEBUG: Contatori per analisi
         total_partitions = 0
         assigned_partitions = 0
-        orphan_partitions = 0  # Senza intersezioni sopra soglia
-        invalid = 0  # geometrie non valide
-        empty = 0  # geometrie vuote
-        with_intersections_no_p = 0  # Con intersezioni MA P=None (il vero problema)
+        orphan_partitions = 0  # senza intersezioni sopra soglia
+        empty_or_invalid = 0  # geometrie non valide o vuote
+        with_intersections_no_p = 0  # Con intersezioni MA field=None
 
         for feat in polygonized.getFeatures():
+
             geometry = feat.geometry()
 
             if not check_geometry(geometry):
                 continue
 
             total_partitions += 1
+            max_value = None
+            has_valid_intersections = False
+            has_null_attr_intersections = False
 
-            max_p = None
-            matching_none = list()
-            all_matches = list()
+            for layer_idx, (fdict, layer, field_idx) in enumerate(
+                zip(layers_feature_dict, poly_layers, field_indices)
+            ):
+                candidates = layer_indexes[layer_idx].intersects(geometry.boundingBox())
 
-            for features, layer in zip(layers_feature_list, poly_layers):
-                for f in features:
+                for feat_id in candidates:
+                    f = fdict[feat_id]
                     input_geometry = f.geometry()
-                    attr_value = f[field]
+                    attr_value = f[field_idx]
 
-                    # controllo se esiste un'intersezione
                     if not geometry.intersects(input_geometry):
                         continue
 
                     _intx = geometry.intersection(input_geometry)
 
-                    # controllo se geometria intersezione è valida
+                    # controllo geometria
                     if not check_geometry(_intx):
+                        empty_or_invalid += 1
                         continue
 
                     # Verifica la soglia areale
@@ -209,54 +242,44 @@ class ResolvePolygonOverlay(QgsProcessingAlgorithm):
                     if intersection_area < area_threshold:
                         continue
 
-                    all_matches.append(
-                        {
-                            "layer": layer.name(),
-                            "area": intersection_area,
-                            "attr_value": attr_value,
-                        }
-                    )
-
                     if attr_value is None:
-                        matching_none.append(
-                            {
-                                "layer": layer.name(),
-                                "area": intersection_area,
-                            }
-                        )
+                        has_null_attr_intersections = True
+                        has_valid_intersections = False
 
                     else:
-                        if max_p is None or attr_value > max_p:
-                            max_p = attr_value
+                        has_null_attr_intersections = False
+                        has_valid_intersections = True
+
+                        if max_value is None or attr_value > max_value:
+                            max_value = attr_value
 
             out_feat = QgsFeature(out_fields)
             out_feat.setGeometry(geometry)
-            out_feat[field] = max_p
+            out_feat[field.upper()] = max_value
 
-            if max_p is None and clean:
+            if max_value is None and clean:
                 continue
             else:
                 sink.addFeature(out_feat, QgsFeatureSink.FastInsert)
 
             # DEBUG: Categorizzazione
-            if max_p is not None:
+            if max_value is not None:
                 assigned_partitions += 1
             else:
-                if len(matching_none) > 0:  # Ha intersezioni sopra soglia, ma P=None
+                if has_null_attr_intersections:
                     with_intersections_no_p += 1
-                elif len(all_matches) == 0:  # Ha intersezioni, ma tutte sotto soglia
+                elif not has_valid_intersections:
                     orphan_partitions += 1
                 else:  # Nessuna intersezione
                     orphan_partitions += 1
 
         # Report debug
-        feedback.pushInfo(f"=== REPORT DEBUG ===")
-        feedback.pushInfo(f"Partizioni senza geometria: {empty}")
-        feedback.pushInfo(f"Partizioni non valide: {invalid}")
-        feedback.pushInfo(f"Partizioni con geometrie valide totali: {total_partitions}")
-        feedback.pushInfo(f"    di cui assegnate: {assigned_partitions}")
-        feedback.pushInfo(f"    di cui senza intersezioni valide: {orphan_partitions}")
-        feedback.pushInfo(
+        feedback.pushDebugInfo(f"=== REPORT DEBUG ===")
+        feedback.pushDebugInfo(f"Partizioni vuote o non valide: {empty_or_invalid}")
+        feedback.pushDebugInfo(f"Partizioni con geometrie valide totali: {total_partitions}")
+        feedback.pushDebugInfo(f"    di cui assegnate: {assigned_partitions}")
+        feedback.pushDebugInfo(f"    di cui senza intersezioni valide: {orphan_partitions}")
+        feedback.pushDebugInfo(
             f"    di cui con intersezioni ma {field}=None: {with_intersections_no_p}"
         )
 

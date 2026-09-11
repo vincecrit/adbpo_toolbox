@@ -122,7 +122,7 @@ class ResolvePolygonOverlay(QgsProcessingAlgorithm):
         feedback.pushDebugInfo(f"Soglia areale: {area_threshold}")
         feedback.pushDebugInfo(f"Nome campo input: {field}")
 
-        verified = list()
+        verified_layers = list()
         for layer in poly_layers:
             feedback.pushDebugInfo(
                 f"Layer: {layer.name()} | CRS: {layer.sourceCrs().authid()} | Features: {layer.featureCount()}"
@@ -133,15 +133,15 @@ class ResolvePolygonOverlay(QgsProcessingAlgorithm):
 
             if layer.sourceCrs() != crs:
                 layer = native_reprojectlayer(layer, crs)
-                verified.append(layer)
+                verified_layers.append(layer)
             else:
-                verified.append(layer)
+                verified_layers.append(layer)
 
         feedback.pushDebugInfo(f"=== ESECUZIONE ===")
 
         # DISSOLVI
         dissolved_layers = list()
-        for layer in verified:
+        for layer in verified_layers:
             dissolved = native_dissolve(
                 layer, field, False, context=context, feedback=feedback
             )
@@ -154,29 +154,29 @@ class ResolvePolygonOverlay(QgsProcessingAlgorithm):
         lines = native_polygonstolines(merged, context=context, feedback=feedback)
 
         # POLIGONIZZA
-        polygonized = native_polygonize(lines, context=context, feedback=feedback)
+        polygonized = native_polygonize(lines, keep_fields=True, context=context, feedback=feedback)
 
         # PRE-CACHE INPUT FEATURES
-        layers_feature_dict = list()
+        verified_feature_dict = list()
         field_indices = list()
         layer_indexes = list()
 
-        for layer in verified:
+        for layer in verified_layers:
             idx = QgsSpatialIndex()
-            fdict = dict()
+            feature_dict = dict()
 
-            for f in layer.getFeatures():
-                fdict[f.id()] = f
-                idx.insertFeature(f)
+            for feature in layer.getFeatures():
+                feature_dict[feature.id()] = feature
+                idx.insertFeature(feature)
 
-            layers_feature_dict.append(fdict)
+            verified_feature_dict.append(feature_dict)
 
-            field_idx = layer.fields().indexOf(field)
-            field_indices.append(field_idx)
+            field_index = layer.fields().indexOf(field)
+            field_indices.append(field_index)
             layer_indexes.append(idx)
 
             # Verifica che il campo esista
-            if field_idx == -1:
+            if field_index == -1:
                 raise QgsProcessingException(
                     f"Campo '{field}' non trovato in layer '{layer.name()}'"
                 )
@@ -205,9 +205,9 @@ class ResolvePolygonOverlay(QgsProcessingAlgorithm):
         empty_or_invalid = 0  # geometrie non valide o vuote
         with_intersections_no_p = 0  # Con intersezioni MA field=None
 
-        for feat in polygonized.getFeatures():
+        for feature in polygonized.getFeatures():
 
-            geometry = feat.geometry()
+            geometry = feature.geometry()
 
             if not check_geometry(geometry):
                 continue
@@ -217,15 +217,15 @@ class ResolvePolygonOverlay(QgsProcessingAlgorithm):
             has_valid_intersections = False
             has_null_attr_intersections = False
 
-            for layer_idx, (fdict, layer, field_idx) in enumerate(
-                zip(layers_feature_dict, poly_layers, field_indices)
+            for ID_N, (feature_dict, layer, field_index) in enumerate(
+                zip(verified_feature_dict, verified_layers, field_indices)
             ):
-                candidates = layer_indexes[layer_idx].intersects(geometry.boundingBox())
+                candidates = layer_indexes[ID_N].intersects(geometry.boundingBox())
 
                 for feat_id in candidates:
-                    f = fdict[feat_id]
-                    input_geometry = f.geometry()
-                    attr_value = f[field_idx]
+                    feature = feature_dict[feat_id]
+                    input_geometry = feature.geometry()
+                    attr_value = feature[field_index]
 
                     if not geometry.intersects(input_geometry):
                         continue

@@ -1,8 +1,7 @@
-from qgis.core import QgsApplication
+from qgis.core import QgsApplication # type:ignore
 from .processing.provider import ProcessingProvider
 
 class AdBPoRisk:
-
     def __init__(self, iface):
         self.iface = iface
         self.provider = None

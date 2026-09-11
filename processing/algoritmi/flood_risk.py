@@ -84,30 +84,35 @@ class CalcRisk(QgsProcessingAlgorithm):
                 "checkbox": self.CREATE_OUT_RP,
                 "output": "Rischio RP",
                 "label": "Reticolo principale",
+                "matrice": RISK_MATRICES['mat1']
             },
             {
                 "input": self.RSCM,
                 "checkbox": self.CREATE_OUT_RSCM,
                 "output": "Rischio RSCM",
                 "label": "Reticolo secondario collinare-montano",
+                "matrice": RISK_MATRICES['mat1']
             },
             {
                 "input": self.RSP,
                 "checkbox": self.CREATE_OUT_RSP,
-                "output": "Rischio RSCM",
+                "output": "Rischio RSP",
                 "label": "Reticolo secondario di pianura",
+                "matrice": RISK_MATRICES['mat3']
             },
             {
                 "input": self.ACM,
                 "checkbox": self.CREATE_OUT_ACM,
                 "output": "Rischio ACM",
                 "label": "Ambito costiero-marino",
+                "matrice": RISK_MATRICES['mat2']
             },
             {
                 "input": self.ACL,
                 "checkbox": self.CREATE_OUT_ACL,
                 "output": "Rischio ACL",
                 "label": "Ambito costiero-lacuale",
+                "matrice": RISK_MATRICES['mat2']
             },
         ]
 
@@ -167,11 +172,11 @@ class CalcRisk(QgsProcessingAlgorithm):
         results = dict()
 
         matrici_rischio = [
-            RISK_MATRICES["mat1"],
-            RISK_MATRICES["mat1"],
-            RISK_MATRICES["mat2"],
-            RISK_MATRICES["mat2"],
-            RISK_MATRICES["mat3"],
+            RISK_MATRICES["mat1"], # matrice per RP
+            RISK_MATRICES["mat1"], # matrice per RSCM
+            RISK_MATRICES["mat3"], # matrice per RSP
+            RISK_MATRICES["mat2"], # matrice per ACM
+            RISK_MATRICES["mat2"], # matrice per ACL
         ]
 
         crs = self.parameterAsCrs(parameters, self.CRS, context)
@@ -212,6 +217,7 @@ class CalcRisk(QgsProcessingAlgorithm):
                     d = feat[DFIELD]
                     rischio = mat.get(p, dict()).get(d, None)
                     intx.changeAttributeValue(feat.id(), intx.fields().indexOf("R"), rischio)
+                
                 intx.commitChanges()
 
                 ambiti_territoriali.append(intx)
@@ -227,10 +233,11 @@ class CalcRisk(QgsProcessingAlgorithm):
                         intx.sourceCrs(),
                     )
 
-                    for feat in intx.getFeatures():
-                        sink.addFeature(feat, QgsFeatureSink.FastInsert)
+                    if sink is not None:
+                        for feat in intx.getFeatures():
+                            sink.addFeature(feat, QgsFeatureSink.FastInsert)
 
-                    results[layer["output"]] = dest_id
+                        results[layer["output"]] = dest_id
 
         solved = solve_overlap(inputs = ambiti_territoriali,
                                field = "R",
@@ -247,9 +254,10 @@ class CalcRisk(QgsProcessingAlgorithm):
             solved.sourceCrs(),
         )
 
-        for feat in solved.getFeatures():
-            main_sink.addFeature(feat, QgsFeatureSink.FastInsert)
+        if main_sink is not None:
+            for feat in solved.getFeatures():
+                main_sink.addFeature(feat, QgsFeatureSink.FastInsert)
 
-        results[self.OUTPUT_MAIN] = main_dest_id
+            results[self.OUTPUT_MAIN] = main_dest_id
 
         return results

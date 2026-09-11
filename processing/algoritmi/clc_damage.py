@@ -17,7 +17,7 @@ from qgis.core import (QgsFeature,  # type:ignore
                        QgsWkbTypes)
 
 
-from ..utils import _get_crs_transformer, native_reprojectlayer
+from ..utils import native_reprojectlayer
 DFIELD = "D"
 
 class CLCToDamage(QgsProcessingAlgorithm):
@@ -116,7 +116,7 @@ class CLCToDamage(QgsProcessingAlgorithm):
                 break
 
             clc_val = str(feat[idx_src])
-            new_val = clc_map.get(clc_val, 1) # valore di default è 1
+            new_val = clc_map.get(clc_val, 1) # classe di danno default è 1
             new_feat = QgsFeature(out_fields)
             geom = feat.geometry()
             new_feat.setGeometry(geom)

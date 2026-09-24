@@ -1,9 +1,7 @@
-from PyQt5.QtCore import QVariant  # type: ignore
 from qgis.core import (  # type: ignore
     QgsCoordinateTransform,
     QgsFeature,
     QgsFeatureSink,
-    QgsField,
     QgsFields,
     QgsProcessing,
     QgsProcessingAlgorithm,
@@ -171,7 +169,7 @@ class ResolvePolygonOverlay(QgsProcessingAlgorithm):
 
             verified_feature_dict.append(feature_dict)
 
-            field_index = layer.fields().indexOf(field)
+            field_index = layer.fields().lookupField(field)
             field_indices.append(field_index)
             layer_indexes.append(idx)
 
@@ -181,9 +179,17 @@ class ResolvePolygonOverlay(QgsProcessingAlgorithm):
                     f"Campo '{field}' non trovato in layer '{layer.name()}'"
                 )
 
-        # OUTPUT SETUP
+        # OUTPUT SETUP: unione dei campi originali di tutti i layer di input,
+        # cosi' l'output riporta gli attributi originali della feature vincente
+        # invece di un singolo campo ricalcolato
         out_fields = QgsFields()
-        out_fields.append(QgsField(field.upper(), QVariant.Int))
+        seen_field_names = set()
+        for layer in verified_layers:
+            for fld in layer.fields():
+                name_key = fld.name().casefold()
+                if name_key not in seen_field_names:
+                    out_fields.append(fld)
+                    seen_field_names.add(name_key)
 
         sink, sink_id = self.parameterAsSink(
             parameters,
@@ -214,6 +220,7 @@ class ResolvePolygonOverlay(QgsProcessingAlgorithm):
 
             total_partitions += 1
             max_value = None
+            winner_feature = None
             has_valid_intersections = False
             has_null_attr_intersections = False
 
@@ -223,9 +230,9 @@ class ResolvePolygonOverlay(QgsProcessingAlgorithm):
                 candidates = layer_indexes[ID_N].intersects(geometry.boundingBox())
 
                 for feat_id in candidates:
-                    feature = feature_dict[feat_id]
-                    input_geometry = feature.geometry()
-                    attr_value = feature[field_index]
+                    cand_feature = feature_dict[feat_id]
+                    input_geometry = cand_feature.geometry()
+                    attr_value = cand_feature[field_index]
 
                     if not geometry.intersects(input_geometry):
                         continue
@@ -244,26 +251,33 @@ class ResolvePolygonOverlay(QgsProcessingAlgorithm):
 
                     if attr_value is None:
                         has_null_attr_intersections = True
-                        has_valid_intersections = False
+                        # has_valid_intersections = False
 
                     else:
-                        has_null_attr_intersections = False
+                        # has_null_attr_intersections = False
                         has_valid_intersections = True
 
                         if max_value is None or attr_value > max_value:
                             max_value = attr_value
+                            winner_feature = cand_feature
 
             out_feat = QgsFeature(out_fields)
             out_feat.setGeometry(geometry)
             out_feat[field.upper()] = max_value
 
-            if max_value is None and clean:
+            if winner_feature is not None:
+                for src_idx, fld in enumerate(winner_feature.fields()):
+                    dst_idx = out_fields.lookupField(fld.name())
+                    if dst_idx != -1:
+                        out_feat.setAttribute(dst_idx, winner_feature.attribute(src_idx))
+
+            if winner_feature is None and clean:
                 continue
             else:
                 sink.addFeature(out_feat, QgsFeatureSink.FastInsert)
 
             # DEBUG: Categorizzazione
-            if max_value is not None:
+            if winner_feature is not None:
                 assigned_partitions += 1
             else:
                 if has_null_attr_intersections:
